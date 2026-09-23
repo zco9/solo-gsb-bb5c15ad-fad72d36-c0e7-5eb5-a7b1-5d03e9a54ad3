@@ -419,6 +419,84 @@ def main() -> None:
         assert client.put("/api/submissions/999999/compilation",
                           json={"windows": []}).status_code == 404
 
+        # --- 双轨对照 ---
+        # 修订轨 cpid：A1=[0,4)（超长 token）、A2=[5,9)
+        # 未上传过：GET / 导出均 404
+        assert client.get(
+            f"/api/submissions/{cpid}/comparison").status_code == 404
+        assert client.get(
+            f"/api/submissions/{cpid}/comparison-export").status_code == 404
+
+        # 对照轨：B1=[0,9) 覆盖两修订 cue（中间含 1s 间隙），B2=[9,11) 独立
+        cmp_vtt = (
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:09.000\n合并覆盖两条修订 cue\n\n"
+            "00:00:09.000 --> 00:00:11.000\n对照轨独有内容\n"
+        )
+        r = client.post(
+            f"/api/submissions/{cpid}/comparison",
+            files={"file": ("other.vtt", cmp_vtt, "text/vtt")})
+        assert r.status_code == 200
+        cmp = r.json()
+        assert cmp["filename"] == "other.vtt" and cmp["cue_count"] == 2
+        # 全局最优：A1+A2 合并配对 B1（并集 [0,9) 交集 9s），B2 独立
+        assert [(row["kind"], [c["seq"] for c in row["a"]],
+                 [c["seq"] for c in row["b"]]) for row in cmp["rows"]] == [
+            ("pair", [0, 1], [0]), ("b_only", [], [1])]
+        assert cmp["rows"][0]["overlap"] == 9.0
+        assert cmp["stats"]["merged"] == 1 and cmp["stats"]["paired"] == 1
+        assert cmp["stats"]["b_only"] == 1
+
+        # 重开（GET）取回已保存结果
+        got = client.get(f"/api/submissions/{cpid}/comparison")
+        assert got.status_code == 200
+        assert got.json()["rows"] == cmp["rows"]
+
+        # CSV 导出：BOM、中文表头、合并序号与时间码、独立成行均在
+        csv_resp = client.get(
+            f"/api/submissions/{cpid}/comparison-export")
+        assert csv_resp.status_code == 200
+        assert csv_resp.text.startswith("﻿")
+        assert "comparison.csv" in csv_resp.headers["content-disposition"]
+        assert "修订cue序号,修订轨时间码,修订轨文本" in csv_resp.text
+        assert "1 + 2" in csv_resp.text          # 合并的修订 cue 序号
+        assert "00:00:00.000 --> 00:00:09.000" in csv_resp.text
+        assert "对照轨独有内容" in csv_resp.text
+        assert "仅对照轨" in csv_resp.text
+        # 每条对照行各占一行（文本内换行被替换，不会多出物理行）
+        assert csv_resp.text.count("\n") == 3   # 表头 + 2 行 + 结尾
+
+        # 重新上传即覆盖（SRT 逗号时间码可解析，仅一条与 A2 对齐）
+        cmp_srt = (
+            "1\n00:00:05,000 --> 00:00:09,000\n仅对齐第二条\n\n"
+        )
+        r2 = client.post(
+            f"/api/submissions/{cpid}/comparison",
+            files={"file": ("other.srt", cmp_srt, "text/plain")})
+        assert r2.status_code == 200
+        cmp2 = r2.json()
+        assert cmp2["format"] == "srt" and cmp2["cue_count"] == 1
+        kinds = [(row["kind"], [c["seq"] for c in row["a"]],
+                  [c["seq"] for c in row["b"]]) for row in cmp2["rows"]]
+        assert kinds == [("a_only", [0], []), ("pair", [1], [0])]
+        assert client.get(
+            f"/api/submissions/{cpid}/comparison").json()["filename"] == \
+            "other.srt"
+
+        # 非法文件：400 且不覆盖既有对照
+        bad = client.post(
+            f"/api/submissions/{cpid}/comparison",
+            files={"file": ("x.vtt", b"not a subtitle", "text/vtt")})
+        assert bad.status_code == 400
+        assert client.get(
+            f"/api/submissions/{cpid}/comparison").json()["cue_count"] == 1
+
+        # 不存在的任务
+        assert client.post(
+            "/api/submissions/999999/comparison",
+            files={"file": ("x.vtt", cmp_vtt, "text/vtt")},
+        ).status_code == 404
+
     print("SMOKE_TESTS_OK")
 
 

@@ -9,7 +9,7 @@
 <body>
   <header class="topbar">
     <h1>字幕断句校验台</h1>
-    <span class="subtitle">WebVTT / SRT · 动态规划断句 · 边界重分配 · 术语审校 · 问题最小化标注</span>
+    <span class="subtitle">WebVTT / SRT · 动态规划断句 · 边界重分配 · 术语审校 · 双轨对照 · 问题最小化标注</span>
   </header>
 
   <main>
@@ -161,6 +161,38 @@
               <tbody></tbody>
             </table>
           </div>
+        </div>
+      </div>
+      <div class="comparison" id="comparison">
+        <div class="result-head term-head">
+          <h3>双轨对照 <span class="muted">为已保存的修订 cue 上传另一轨 SRT/WebVTT，全局动态规划配对供人工校对</span></h3>
+          <div class="term-ops">
+            <label class="file-label cmp-file-label">
+              <input type="file" id="cmp-file" accept=".vtt,.srt" />
+              <span id="cmp-file-name">选择对照轨 .vtt / .srt…</span>
+            </label>
+            <button id="cmp-upload" class="primary">上传并生成对照</button>
+            <button id="cmp-export" class="secondary" disabled>导出对照 CSV</button>
+          </div>
+        </div>
+        <p class="muted comp-hint">
+          仅正时长交集可配对；以「交集总时长最大 → 合并次数最少 → 中心时间偏差最小」
+          为顺序做全局动态规划，支持一对一及任一轨最多两条相邻 cue 对另一轨一条，
+          未配对 cue 独立成行。对照轨与结果按任务保存，重开自动载入，重新上传即覆盖。
+        </p>
+        <p class="error" id="cmp-error" hidden></p>
+        <div id="cmp-summary" class="stats cmp-stats"></div>
+        <div class="table-wrap cmp-wrap">
+          <table id="cmp-table">
+            <thead>
+              <tr>
+                <th>修订 #</th><th>修订轨时间码</th><th>修订轨文本</th>
+                <th class="cmp-mid">配对 / 交集 / 中心偏差</th>
+                <th>对照 #</th><th>对照轨时间码</th><th>对照轨文本</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
         </div>
       </div>
     </section>

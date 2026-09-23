@@ -26,6 +26,7 @@
   let termLanguages = {};
   let compWindows = [];
   let currentCompilation = null;
+  let currentComparison = null;
 
   const fmtTc = (s) => {
     if (s == null || isNaN(s)) return "--:--:--.---";
@@ -72,6 +73,7 @@
       render(data);
       loadFindings(data.id);
       resetCompilation();
+      loadComparison(data.id);
     } catch (err) {
       errBox.textContent = err.message;
       errBox.hidden = false;
@@ -541,6 +543,127 @@
       `/api/submissions/${current.id}/compilation-export`;
   });
 
+  /* ---------- 双轨对照 ---------- */
+
+  const CMP_KIND_LABELS = {
+    pair: "配对",
+    a_only: "仅修订轨",
+    b_only: "仅对照轨",
+  };
+
+  function resetComparison() {
+    currentComparison = null;
+    $("#cmp-export").disabled = true;
+    $("#cmp-error").hidden = true;
+    $("#cmp-file").value = "";
+    $("#cmp-file-name").textContent = "选择对照轨 .vtt / .srt…";
+    $("#cmp-file-name").parentElement.classList.remove("has-file");
+    $("#cmp-summary").innerHTML = "";
+    $("#cmp-table tbody").innerHTML =
+      '<tr><td colspan="7" class="muted">尚未上传对照轨；' +
+      "上传另一轨 SRT/WebVTT 后在此生成双轨对照表。</td></tr>";
+  }
+
+  function cmpSideCell(side, cls) {
+    if (!side.length) return '<td class="cmp-empty">—</td>'.repeat(3);
+    const seqs = side.map((c) => c.seq + 1).join(" + ");
+    const codes = side.map((c) => `${fmtTc(c.start)} → ${fmtTc(c.end)}`)
+      .join("<br/>");
+    const texts = side.map((c) => `<span>${escapeHtml(c.text)}</span>`)
+      .join('<span class="cmp-join">＋</span>');
+    return `<td class="tc ${cls}">${seqs}</td>` +
+      `<td class="tc ${cls}">${codes}</td>` +
+      `<td class="cue-text ${cls}">${texts}</td>`;
+  }
+
+  function renderComparison(data) {
+    currentComparison = data;
+    $("#cmp-export").disabled = false;
+    const s = data.stats;
+    $("#cmp-summary").innerHTML = `
+      <div class="stat"><b>${escapeHtml(data.filename)}</b>对照轨（${data.cue_count} 条）</div>
+      <div class="stat"><b>${s.row_count}</b>对照行</div>
+      <div class="stat good"><b>${s.paired}</b>配对</div>
+      <div class="stat"><b>${s.merged}</b>合并配对</div>
+      <div class="stat"><b>${s.a_only}</b>仅修订轨</div>
+      <div class="stat"><b>${s.b_only}</b>仅对照轨</div>
+      <div class="stat"><b>${s.total_overlap.toFixed(3)}s</b>交集总时长</div>
+      <div class="stat"><b>${s.avg_center_delta == null ? "—" :
+        s.avg_center_delta.toFixed(3) + "s"}</b>平均中心偏差</div>`;
+
+    $("#cmp-table tbody").innerHTML = data.rows.map((r) => {
+      let mid;
+      if (r.kind === "pair") {
+        const merged = r.a.length + r.b.length > 2;
+        mid = `<td class="cmp-mid tc">
+          <span class="cmp-kind ${merged ? "cmp-merged" : ""}">` +
+          `${merged ? "合并配对" : "一对一"}</span><br/>
+          交集 ${r.overlap.toFixed(3)}s<br/>偏差 ${r.center_delta.toFixed(3)}s
+        </td>`;
+      } else {
+        mid = `<td class="cmp-mid tc cmp-empty">${CMP_KIND_LABELS[r.kind]}</td>`;
+      }
+      return `<tr class="cmp-${r.kind}">` +
+        cmpSideCell(r.a, "cmp-a") + mid + cmpSideCell(r.b, "cmp-b") + "</tr>";
+    }).join("");
+  }
+
+  async function loadComparison(sid) {
+    resetComparison();
+    try {
+      const resp = await fetch(`/api/submissions/${sid}/comparison`);
+      if (resp.status === 404) return;  // 该任务尚未上传对照轨
+      const data = await resp.json();
+      if (!resp.ok) return;
+      renderComparison(data);
+    } catch (_) {
+      /* 对照轨加载失败不阻塞结果页 */
+    }
+  }
+
+  $("#cmp-file").addEventListener("change", (e) => {
+    const label = $("#cmp-file-name");
+    label.textContent = e.target.files[0]?.name || "选择对照轨 .vtt / .srt…";
+    label.parentElement.classList.toggle("has-file", !!e.target.files[0]);
+  });
+
+  $("#cmp-upload").addEventListener("click", async () => {
+    if (!current) return;
+    const errBox = $("#cmp-error");
+    errBox.hidden = true;
+    const f = $("#cmp-file").files[0];
+    if (!f) {
+      errBox.textContent = "请先选择对照轨 .vtt / .srt 文件";
+      errBox.hidden = false;
+      return;
+    }
+    const body = new FormData();
+    body.append("file", f);
+    const btn = $("#cmp-upload");
+    btn.disabled = true;
+    btn.textContent = "对齐计算中…";
+    try {
+      const resp = await fetch(
+        `/api/submissions/${current.id}/comparison`,
+        { method: "POST", body });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "对照生成失败");
+      renderComparison(data);
+    } catch (err) {
+      errBox.textContent = err.message;
+      errBox.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "上传并生成对照";
+    }
+  });
+
+  $("#cmp-export").addEventListener("click", () => {
+    if (!current || !currentComparison) return;
+    window.location.href =
+      `/api/submissions/${current.id}/comparison-export`;
+  });
+
   /* ---------- 历史任务 ---------- */
 
   async function loadHistory() {
@@ -569,6 +692,7 @@
           render(current);
           loadFindings(current.id);
           loadCompilation(current.id);
+          loadComparison(current.id);
         }));
     } catch (_) {
       /* 历史加载失败不阻塞主流程 */

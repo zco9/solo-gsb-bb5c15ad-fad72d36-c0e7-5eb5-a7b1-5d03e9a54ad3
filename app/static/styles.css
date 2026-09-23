@@ -342,3 +342,49 @@ li.accepted .fnd-status { color: var(--ok-ink); }
   padding: 1px 7px;
   font-variant-numeric: tabular-nums;
 }
+
+/* --- 双轨对照 --- */
+.comparison {
+  margin-top: 16px;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+.cmp-file-label {
+  padding: 7px 12px;
+  font-size: 13px;
+}
+.cmp-stats { margin: 10px 0; }
+.cmp-stats b { margin-right: 2px; }
+.cmp-wrap { max-height: 620px; }
+#cmp-table .cue-text { max-width: 300px; min-width: 180px; }
+#cmp-table .cmp-mid {
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  min-width: 110px;
+}
+.cmp-kind {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  margin-bottom: 2px;
+  background: #e7f6ec;
+  color: var(--ok-ink);
+}
+.cmp-kind.cmp-merged { background: #fff0cf; color: var(--warn-ink); }
+tr.cmp-pair { background: #f6faf7; }
+tr.cmp-a_only td.cmp-a { background: var(--warn-bg); }
+tr.cmp-b_only td.cmp-b { background: var(--warn-bg); }
+.cmp-empty { color: var(--muted); }
+.cmp-join {
+  display: block;
+  text-align: center;
+  color: var(--brand);
+  font-size: 11px;
+  margin: 2px 0;
+}
+@media (max-width: 1100px) {
+  .cmp-file-label { width: 100%; }
+}

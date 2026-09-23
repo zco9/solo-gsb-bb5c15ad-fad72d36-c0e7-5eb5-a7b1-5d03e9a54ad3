@@ -59,6 +59,17 @@ CREATE TABLE IF NOT EXISTS compilations (
     updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS comparisons (
+    submission_id INTEGER PRIMARY KEY
+        REFERENCES submissions(id) ON DELETE CASCADE,
+    filename      TEXT NOT NULL,
+    format        TEXT NOT NULL DEFAULT 'vtt',
+    cue_count     INTEGER NOT NULL DEFAULT 0,
+    cues_json     TEXT NOT NULL DEFAULT '[]',
+    rows_json     TEXT NOT NULL DEFAULT '[]',
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS terms (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     language    TEXT NOT NULL DEFAULT 'all',
@@ -246,6 +257,47 @@ def get_compilation(submission_id: int) -> list[tuple[float, float]] | None:
         return None
     raw = json.loads(row["windows_json"] or "[]")
     return [(float(w["start"]), float(w["end"])) for w in raw]
+
+
+# --- 双轨对照（对照轨按任务保存，重新上传覆盖） ---
+
+def save_comparison(submission_id: int, filename: str, fmt: str,
+                    cues: list[dict], rows: list[dict]) -> None:
+    """保存（覆盖）该任务的对照轨及对齐结果。"""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO comparisons
+                   (submission_id, filename, format, cue_count,
+                    cues_json, rows_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(submission_id) DO UPDATE SET
+                   filename = excluded.filename,
+                   format = excluded.format,
+                   cue_count = excluded.cue_count,
+                   cues_json = excluded.cues_json,
+                   rows_json = excluded.rows_json,
+                   updated_at = datetime('now')""",
+            (submission_id, filename, fmt, len(cues),
+             json.dumps(cues, ensure_ascii=False),
+             json.dumps(rows, ensure_ascii=False)),
+        )
+
+
+def get_comparison(submission_id: int) -> dict | None:
+    """返回已保存的对照轨与对齐行；从未上传返回 None。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT submission_id, filename, format, cue_count,
+                      cues_json, rows_json, updated_at
+               FROM comparisons WHERE submission_id = ?""",
+            (submission_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    data = dict(row)
+    data["cues"] = json.loads(data.pop("cues_json") or "[]")
+    data["rows"] = json.loads(data.pop("rows_json") or "[]")
+    return data
 
 
 # --- 术语表 ---

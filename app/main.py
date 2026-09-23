@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from . import database as db
 from . import terms as terms_mod
 from . import compilation as comp_mod
+from . import aligner as align_mod
 from .segmenter import analyze
 from .subtitles import (LANGUAGE_NAMES, Cue, format_timestamp, parse_subtitle,
                         write_vtt)
@@ -23,6 +24,20 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 # 术语语言：除检测语言外支持「通用」（对全部 cue 生效）
 TERM_LANGUAGES = {"all": "通用", **LANGUAGE_NAMES}
+
+
+def _decode_subtitle(raw: bytes) -> str:
+    """解码上传字幕字节（UTF-8 BOM 优先，失败退回 Latin-1）；空文件报错。"""
+    if not raw:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            return raw.decode("latin-1")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400,
+                                detail="无法识别文件编码，请使用 UTF-8")
 
 
 @asynccontextmanager
@@ -173,6 +188,178 @@ async def api_compilation_export(sid: int):
     )
 
 
+# --- 双轨对照 ---
+
+ALIGN_KIND_LABELS = {
+    "pair": "配对",
+    "a_only": "仅修订轨",
+    "b_only": "仅对照轨",
+}
+
+
+def _side_cues(cues: list[Cue], idxs: list[int]) -> list[dict]:
+    return [{
+        "seq": k,
+        "start": round(cues[k].start, 3),
+        "end": round(cues[k].end, 3),
+        "duration": round(cues[k].end - cues[k].start, 3),
+        "text": cues[k].text,
+    } for k in idxs]
+
+
+def _comparison_payload(sid: int, a_cues: list[Cue], b_cues: list[Cue],
+                        filename: str, fmt: str) -> dict:
+    """跑全局 DP 对齐，返回对照行，并把 cue/行结构规整为可持久化 JSON。"""
+    rows = align_mod.align(a_cues, b_cues)
+    paired = [r for r in rows if r.kind == "pair"]
+    total_overlap = round(sum(r.overlap for r in paired), 3)
+    merged = sum(1 for r in paired if len(r.a) + len(r.b) > 2)
+    avg_dev = (round(sum(r.center_delta for r in paired) / len(paired), 3)
+               if paired else None)
+    out_rows = [{
+        "kind": r.kind,
+        "a": _side_cues(a_cues, r.a),
+        "b": _side_cues(b_cues, r.b),
+        "overlap": r.overlap,
+        "center_delta": r.center_delta,
+    } for r in rows]
+    stored_cues = [{
+        "seq": i,
+        "start": round(c.start, 3),
+        "end": round(c.end, 3),
+        "text": c.text,
+    } for i, c in enumerate(b_cues)]
+    return {
+        "id": sid,
+        "filename": filename,
+        "format": fmt,
+        "cue_count": len(b_cues),
+        "revised_count": len(a_cues),
+        "track_cues": stored_cues,
+        "rows": out_rows,
+        "stats": {
+            "row_count": len(out_rows),
+            "paired": len(paired),
+            "a_only": sum(1 for r in rows if r.kind == "a_only"),
+            "b_only": sum(1 for r in rows if r.kind == "b_only"),
+            "merged": merged,
+            "total_overlap": total_overlap,
+            "avg_center_delta": avg_dev,
+        },
+    }
+
+
+def _stored_comparison_payload(record: dict, comp: dict) -> dict:
+    """从已存储结构重建响应（对齐结果在上传时已固化）。"""
+    return {
+        "id": record["submission"]["id"],
+        "filename": comp["filename"],
+        "format": comp["format"],
+        "cue_count": comp["cue_count"],
+        "revised_count": len(record["cues"]),
+        "track_cues": comp["cues"],
+        "rows": comp["rows"],
+        "stats": {
+            "row_count": len(comp["rows"]),
+            "paired": sum(1 for r in comp["rows"] if r["kind"] == "pair"),
+            "a_only": sum(1 for r in comp["rows"] if r["kind"] == "a_only"),
+            "b_only": sum(1 for r in comp["rows"] if r["kind"] == "b_only"),
+            "merged": sum(1 for r in comp["rows"]
+                          if r["kind"] == "pair"
+                          and len(r["a"]) + len(r["b"]) > 2),
+            "total_overlap": round(sum(r.get("overlap", 0.0)
+                                       for r in comp["rows"]
+                                       if r["kind"] == "pair"), 3),
+            "avg_center_delta": (
+                round(sum(r["center_delta"] for r in comp["rows"]
+                          if r["kind"] == "pair")
+                      / sum(1 for r in comp["rows"] if r["kind"] == "pair"),
+                      3)
+                if any(r["kind"] == "pair" for r in comp["rows"]) else None),
+        },
+    }
+
+
+@app.post("/api/submissions/{sid}/comparison")
+async def api_save_comparison(sid: int, file: UploadFile = File(...)):
+    """上传另一轨 SRT/WebVTT，跑全局对齐并按任务覆盖保存对照表。"""
+    record = db.get_artifact(sid)
+    if record is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    content = _decode_subtitle(await file.read())
+    name = file.filename or "comparison"
+    fmt = "srt" if name.lower().endswith(".srt") else "vtt"
+    try:
+        b_cues = parse_subtitle(content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    a_cues = [Cue(start=c["start_sec"], end=c["end_sec"], text=c["text"])
+              for c in record["cues"]]
+    payload = _comparison_payload(sid, a_cues, b_cues, name, fmt)
+    db.save_comparison(sid, name, fmt, payload["track_cues"], payload["rows"])
+    return payload
+
+
+@app.get("/api/submissions/{sid}/comparison")
+async def api_get_comparison(sid: int):
+    record = db.get_artifact(sid)
+    if record is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    comp = db.get_comparison(sid)
+    if comp is None:
+        raise HTTPException(status_code=404, detail="该任务尚未上传对照轨")
+    return _stored_comparison_payload(record, comp)
+
+
+def _csv_cell(side: list[dict]) -> tuple[str, str, str]:
+    """把一侧（可能合并两条）的 cue 拼成序号 / 时间码 / 文本三个 CSV 单元。"""
+    if not side:
+        return "", "", ""
+    seqs = " + ".join(str(c["seq"] + 1) for c in side)
+    codes = " / ".join(f"{format_timestamp(c['start'])} --> "
+                       f"{format_timestamp(c['end'])}" for c in side)
+    text = " / ".join(c["text"].replace("\n", " / ") for c in side)
+    return seqs, codes, text
+
+
+@app.get("/api/submissions/{sid}/comparison-export")
+async def api_comparison_export(sid: int):
+    """导出含全部对照行的 UTF-8 CSV（带 BOM，Excel 可直接打开）。"""
+    record = db.get_artifact(sid)
+    if record is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    comp = db.get_comparison(sid)
+    if comp is None:
+        raise HTTPException(status_code=404, detail="该任务尚未上传对照轨")
+
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(["行号", "配对类型", "修订cue序号", "修订轨时间码",
+                     "修订轨文本", "对照cue序号", "对照轨时间码", "对照轨文本",
+                     "交集时长(秒)", "中心偏差(秒)"])
+    for i, row in enumerate(comp["rows"], start=1):
+        a_seq, a_code, a_text = _csv_cell(row["a"])
+        b_seq, b_code, b_text = _csv_cell(row["b"])
+        writer.writerow([
+            i,
+            ALIGN_KIND_LABELS[row["kind"]],
+            a_seq, a_code, a_text,
+            b_seq, b_code, b_text,
+            f"{row['overlap']:.3f}" if row["kind"] == "pair" else "",
+            (f"{row['center_delta']:.3f}"
+             if row["kind"] == "pair" else ""),
+        ])
+
+    base = record["submission"]["filename"].rsplit(".", 1)[0]
+    filename = f"{base}.comparison.csv"
+    return Response(
+        content="﻿" + buf.getvalue(),  # BOM，便于 Excel 直接打开
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.post("/api/analyze")
 async def api_analyze(
     file: UploadFile = File(...),
@@ -181,16 +368,7 @@ async def api_analyze(
     max_cps: float = Form(12.0),
 ):
     raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="上传文件为空")
-    try:
-        content = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        try:
-            content = raw.decode("latin-1")
-        except UnicodeDecodeError:
-            raise HTTPException(status_code=400,
-                                detail="无法识别文件编码，请使用 UTF-8")
+    content = _decode_subtitle(raw)
 
     name = file.filename or "subtitles"
     fmt = "srt" if name.lower().endswith(".srt") else "vtt"

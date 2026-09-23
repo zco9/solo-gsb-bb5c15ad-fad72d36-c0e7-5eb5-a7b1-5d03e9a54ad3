@@ -9,6 +9,11 @@ cue 文本做**动态规划断句**，必要时在相邻 cue 间**重分配边�
 词），上传字幕后自动跨 cue 检测同一术语的大小写、全半角、标点与近似拼写
 差异，逐项确认后批量生成术语修订 WebVTT，并可导出审校报告。
 
+还支持**双轨对照**：在任一任务结果页为已保存的修订 cue 上传另一轨
+SRT/WebVTT，系统以全局动态规划（交集总时长最大、合并次数最少、中心偏差
+最小）配对两条时间轴，生成供人工校对的双轨对照表，并按任务保存、可导出
+UTF-8 CSV。
+
 ## 一键启动
 
 ```bash
@@ -20,7 +25,9 @@ docker compose up --build
 > http://localhost:8000
 
 首页即上传入口；上传分析完成后在同页「校验结果」卡片依次使用问题筛选、
-**片段合辑**与术语审校（均在结果页内，端口固定为宿主机 `8000`）。
+**片段合辑**、**双轨对照**与术语审校（均在结果页内，端口固定为宿主机
+`8000`）。无需任何额外配置：唯一可选环境变量 `DB_PATH`（默认
+`/data/subtitles.db`）指向 SQLite 文件位置。
 
 SQLite 数据库文件位于容器内 `/data/subtitles.db`，通过 Compose 命名卷
 `subtitle-data` 持久化；**数据库表在应用启动时自动初始化**，无需手工建表。
@@ -64,6 +71,17 @@ SQLite 数据库文件位于容器内 `/data/subtitles.db`，通过 Compose 命�
   `NOTE`）；空窗口集导出结构有效的空 WebVTT，原修订导出不受任何影响。
   窗口配置按任务存入 SQLite（覆盖式保存），从历史任务重开时自动载入，
   可继续编辑、重新生成。
+- **双轨对照（人工校对用）**：在结果页「双轨对照」区为已保存的修订 cue
+  上传**另一轨 SRT/WebVTT**，系统对两条时间轴做**全局动态规划**配对，
+  生成双轨对照表供人工校对。配对仅在存在**正时长交集**时成立，允许
+  **一对一**以及任一轨**最多两条相邻 cue 合并**后对另一轨一条；两条 cue
+  合并后的交集按其**时间并集**（含中间间隙）计分。优化目标按字典序为
+  **交集总时长最大 → 合并次数最少 → 中心时间偏差总和最小**，因此不会因
+  局部贪心造成后续错位；无法配对的 cue **独立成行**。对照表每行显示双轨
+  的**时间码、序号与文本**以及交集时长/中心偏差，合并配对有标记。
+  对照轨与对齐结果按任务存入 SQLite，**重开历史任务自动载入**，**重新
+  上传即覆盖**；「导出对照 CSV」输出含**全部对照行**的 UTF-8（BOM）CSV
+  （`xxx.comparison.csv`）。
 - **历史任务**：每次校验存入 SQLite，可重新查看或再次导出。
 
 ## 术语审校
@@ -129,6 +147,9 @@ SQLite 数据库文件位于容器内 `/data/subtitles.db`，通过 Compose 命�
 | PUT  | `/api/submissions/{id}/compilation` | 保存（覆盖）片段合辑窗口配置（JSON：`{"windows":[{"start":s,"end":e},…]}`，按数组顺序拼接），返回合辑 cue（含原 cue 序号、合辑时间码、校验 NOTE） |
 | GET  | `/api/submissions/{id}/compilation` | 读取已保存的合辑配置与结果（未配置返回 404；空窗口集返回空合辑） |
 | GET  | `/api/submissions/{id}/compilation-export` | 下载独立合辑 WebVTT（`xxx.compilation.vtt`；空窗口集为结构有效的空 WebVTT） |
+| POST | `/api/submissions/{id}/comparison` | multipart 上传另一轨 `file`（`.vtt`/`.srt`），全局 DP 对齐并覆盖保存，返回双轨对照行与统计 |
+| GET  | `/api/submissions/{id}/comparison` | 读取已保存的对照轨与对照表（未上传返回 404） |
+| GET  | `/api/submissions/{id}/comparison-export` | 下载含全部对照行的 UTF-8（BOM）CSV（`xxx.comparison.csv`） |
 | GET  | `/api/terms` | 术语表列表（支持 `?language=zh` 过滤，通用术语一并返回） |
 | POST | `/api/terms` | 新增术语（JSON：`language`/`canonical`/`variants`/`forbidden`/`note`） |
 | PUT  | `/api/terms/{id}` | 更新术语 |
@@ -153,16 +174,18 @@ DB_PATH=./data/subtitles.db uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-├── main.py          # FastAPI 路由与静态文件挂载（含片段合辑接口）
+├── main.py          # FastAPI 路由与静态文件挂载（含片段合辑/双轨对照接口）
 ├── compilation.py   # 半开窗口校验 + cue 裁切/新时间轴拼接
+├── aligner.py       # 双轨时间轴全局动态规划对齐（一对一/最多二合一/独立成行）
 ├── segmenter.py     # 单元切分 + DP 断句 + 边界重分配 + 问题生成
 ├── subtitles.py     # VTT/SRT 解析、VTT 导出、语言检测
 ├── terms.py         # 术语表模型 + 多层归一匹配 + 跨 cue 不一致检测引擎
-├── database.py      # SQLite 初始化与持久化（含术语表/术语发现/合辑配置）
+├── database.py      # SQLite 初始化与持久化（术语/发现/合辑/双轨对照）
 └── static/          # 原生 HTML/CSS/JS（无构建步骤）
 tests/smoke_test.py        # FastAPI TestClient 端到端冒烟测试
 tests/term_engine_check.py # 术语引擎独立逻辑校验（仅需标准库）
-tests/compilation_check.py  # 片段合辑裁切/拼接/导出逻辑校验（仅需标准库）
+tests/compilation_check.py # 片段合辑裁切/拼接/导出逻辑校验（仅需标准库）
+tests/aligner_check.py     # 双轨对齐全局 DP 逻辑校验（仅需标准库）
 examples/                  # demo.vtt / demo.srt / terms-demo.vtt 示例字幕
 Dockerfile
 docker-compose.yml
@@ -175,5 +198,6 @@ requirements.txt
 pip install -r requirements.txt
 DB_PATH=/tmp/test.db python3 tests/smoke_test.py   # 端到端（含术语审校）
 python3 tests/term_engine_check.py                 # 术语引擎纯逻辑校验（无需依赖）
-python3 tests/compilation_check.py                  # 片段合辑纯逻辑校验（无需依赖）
+python3 tests/compilation_check.py                 # 片段合辑纯逻辑校验（无需依赖）
+python3 tests/aligner_check.py                     # 双轨对齐 DP 纯逻辑校验（无需依赖）
 ```
