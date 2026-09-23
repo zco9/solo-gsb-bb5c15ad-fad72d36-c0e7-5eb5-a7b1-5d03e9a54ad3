@@ -26,6 +26,7 @@
   let termLanguages = {};
   let compWindows = [];
   let currentCompilation = null;
+  let currentComparison = null;
 
   const fmtTc = (s) => {
     if (s == null || isNaN(s)) return "--:--:--.---";
@@ -72,6 +73,7 @@
       render(data);
       loadFindings(data.id);
       resetCompilation();
+      resetComparison();
     } catch (err) {
       errBox.textContent = err.message;
       errBox.hidden = false;
@@ -541,6 +543,126 @@
       `/api/submissions/${current.id}/compilation-export`;
   });
 
+  /* ---------- 双轨对照 ---------- */
+
+  function cmpSideCell(side, emptyHint) {
+    if (!side.length) return { seqs: "—", tc: "", text: `<em>${emptyHint}</em>` };
+    const seqs = side.map((c) => c.seq + 1).join("+");
+    const tc = side.map((c) => `${fmtTc(c.start)} → ${fmtTc(c.end)}`).join("<br/>");
+    const text = side.map((c) => escapeHtml(c.text).replace(/\n/g, "<br/>"))
+      .join('<span class="cmp-join"></span>');
+    return { seqs, tc, text };
+  }
+
+  function renderComparison(data) {
+    currentComparison = data;
+    $("#cmp-export").disabled = false;
+    $("#cmp-meta").textContent =
+      `对照轨文件：${data.filename} · 更新于 ${data.updated_at}`;
+    const s = data.stats;
+    $("#cmp-stats").innerHTML = `
+      <div class="stat"><b>${s.total_rows}</b>对照行</div>
+      <div class="stat good"><b>${s.paired_rows}</b>已配对</div>
+      <div class="stat"><b>${s.merge_rows}</b>合并配对</div>
+      <div class="stat"><b>${(s.total_overlap_ms / 1000).toFixed(3)}s</b>交集总时长</div>
+      <div class="stat"><b>${s.mean_center_delta_ms ?? "—"}ms</b>平均中心偏差</div>
+      <div class="stat"><b>${s.left_only_rows}</b>仅修订轨</div>
+      <div class="stat"><b>${s.right_only_rows}</b>仅对照轨</div>`;
+
+    $("#cmp-table tbody").innerHTML = data.rows.map((r) => {
+      const l = cmpSideCell(r.left, "修订轨无对应 cue");
+      const rt = cmpSideCell(r.right, "对照轨无对应 cue");
+      const cls = !r.left.length || !r.right.length ? "cmp-solo"
+        : r.merged ? "cmp-merged" : "";
+      const tag = r.merged ? `<span class="cmp-tag merged">${r.kind_label}</span>`
+        : r.left.length && r.right.length
+          ? `<span class="cmp-tag pair">${r.kind_label}</span>`
+          : `<span class="cmp-tag solo">${r.kind_label}</span>`;
+      return `<tr class="${cls}">
+        <td>${r.row + 1}</td>
+        <td>${tag}</td>
+        <td class="tc">${l.seqs}<br/>${l.tc}</td>
+        <td class="cue-text cmp-text">${l.text}</td>
+        <td class="tc">${rt.seqs}<br/>${rt.tc}</td>
+        <td class="cue-text cmp-text">${rt.text}</td>
+        <td class="tc">${r.left.length && r.right.length
+          ? (r.overlap_ms / 1000).toFixed(3) + "s" : "—"}</td>
+        <td class="tc">${r.left.length && r.right.length
+          ? r.center_delta_ms + "ms" : "—"}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  function resetComparison() {
+    currentComparison = null;
+    $("#cmp-export").disabled = true;
+    $("#cmp-error").hidden = true;
+    $("#cmp-meta").textContent = "尚未上传对照轨；上传后在此查看双轨对照表。";
+    $("#cmp-stats").innerHTML = "";
+    $("#cmp-table tbody").innerHTML = "";
+    $("#cmp-file").value = "";
+    $("#cmp-file-name").textContent = "选择对照轨 .vtt 或 .srt 文件…";
+    $("#cmp-file-name").parentElement.classList.remove("has-file");
+  }
+
+  async function loadComparison(sid) {
+    resetComparison();
+    try {
+      const resp = await fetch(`/api/submissions/${sid}/comparison`);
+      if (resp.status === 404) return;  // 该任务尚未上传对照轨
+      const data = await resp.json();
+      if (!resp.ok) return;
+      renderComparison(data);
+    } catch (_) {
+      /* 对照表加载失败不阻塞结果页 */
+    }
+  }
+
+  $("#cmp-file").addEventListener("change", (e) => {
+    const label = $("#cmp-file-name");
+    label.textContent = e.target.files[0]?.name
+      || "选择对照轨 .vtt 或 .srt 文件…";
+    label.parentElement.classList.toggle("has-file", !!e.target.files[0]);
+  });
+
+  $("#cmp-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!current) return;
+    const errBox = $("#cmp-error");
+    errBox.hidden = true;
+    const f = $("#cmp-file").files[0];
+    if (!f) {
+      errBox.textContent = "请先选择对照轨文件";
+      errBox.hidden = false;
+      return;
+    }
+    const body = new FormData();
+    body.append("file", f);
+    const btn = $("#cmp-btn");
+    btn.disabled = true;
+    btn.textContent = "对齐计算中…";
+    try {
+      const resp = await fetch(
+        `/api/submissions/${current.id}/comparison`,
+        { method: "POST", body });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "对照轨上传失败");
+      renderComparison(data);
+    } catch (err) {
+      errBox.textContent = err.message;
+      errBox.hidden = false;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "上传并生成对照表";
+    }
+  });
+
+  $("#cmp-export").addEventListener("click", () => {
+    if (!current || !currentComparison) return;
+    window.location.href =
+      `/api/submissions/${current.id}/comparison-export`;
+  });
+
   /* ---------- 历史任务 ---------- */
 
   async function loadHistory() {
@@ -569,6 +691,7 @@
           render(current);
           loadFindings(current.id);
           loadCompilation(current.id);
+          loadComparison(current.id);
         }));
     } catch (_) {
       /* 历史加载失败不阻塞主流程 */

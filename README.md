@@ -9,6 +9,10 @@ cue 文本做**动态规划断句**，必要时在相邻 cue 间**重分配边�
 词），上传字幕后自动跨 cue 检测同一术语的大小写、全半角、标点与近似拼写
 差异，逐项确认后批量生成术语修订 WebVTT，并可导出审校报告。
 
+结果页还支持**片段合辑**与**双轨对照**：为已保存的修订 cue 上传另一轨
+SRT/WebVTT，按时间交集做全局动态规划对齐，生成供人工校对的双轨对照表，
+并导出含全部对照行的 UTF-8 CSV。
+
 ## 一键启动
 
 ```bash
@@ -64,6 +68,22 @@ SQLite 数据库文件位于容器内 `/data/subtitles.db`，通过 Compose 命�
   `NOTE`）；空窗口集导出结构有效的空 WebVTT，原修订导出不受任何影响。
   窗口配置按任务存入 SQLite（覆盖式保存），从历史任务重开时自动载入，
   可继续编辑、重新生成。
+- **双轨对照（人工校对）**：在结果页「双轨对照」区块为已保存的修订 cue
+  上传**另一轨 SRT/WebVTT**，系统以修订轨为左轨、对照轨为右轨做**全局
+  动态规划**对齐生成对照表，避免局部贪心造成后续错位：
+  - **仅正时长交集可配对**（仅端点相接或完全不相交的 cue 不配对）；
+  - 允许**一对一**及**任一轨最多两条相邻 cue 合并**后对另一轨一条配对
+    （修订合并 / 对照合并，不允许 2:2）；两条合并 cue 的有效区间取其
+    **时间并集**，交集与中心偏差均按并集与对端 cue 计分；
+  - 全局目标按字典序为 **① 交集总时长最大 → ② 合并次数最少 →
+    ③ 中心时间偏差总和最小**（区间中点之差）；
+  - 未配对 cue **独立成行**；每行显示双轨时间码、cue 序号与文本，
+    并标注配对类型、交集时长与中心偏差；
+  - 对照轨与对照表**按任务保存**（SQLite）：从历史任务重开自动载入，
+    重新上传即覆盖旧对照轨；不影响原修订导出；
+  - 「导出对照表 CSV」输出带 UTF-8 BOM 的 `xxx.comparison.csv`（Excel
+    可直接打开），含**所有对照行**（配对行与未配对独立行），合并 cue
+    在同一单元格内分段列出双轨序号、时间码与文本。
 - **历史任务**：每次校验存入 SQLite，可重新查看或再次导出。
 
 ## 术语审校
@@ -129,6 +149,9 @@ SQLite 数据库文件位于容器内 `/data/subtitles.db`，通过 Compose 命�
 | PUT  | `/api/submissions/{id}/compilation` | 保存（覆盖）片段合辑窗口配置（JSON：`{"windows":[{"start":s,"end":e},…]}`，按数组顺序拼接），返回合辑 cue（含原 cue 序号、合辑时间码、校验 NOTE） |
 | GET  | `/api/submissions/{id}/compilation` | 读取已保存的合辑配置与结果（未配置返回 404；空窗口集返回空合辑） |
 | GET  | `/api/submissions/{id}/compilation-export` | 下载独立合辑 WebVTT（`xxx.compilation.vtt`；空窗口集为结构有效的空 WebVTT） |
+| POST | `/api/submissions/{id}/comparison` | multipart 上传对照轨 `file`（.vtt/.srt）：全局 DP 对齐修订轨并覆盖保存，返回对照表（行类型 `1:1`/`2:1`/`1:2`/`left_only`/`right_only`、双轨时间码序号文本、交集与中心偏差、汇总统计） |
+| GET  | `/api/submissions/{id}/comparison` | 读取已保存的对照轨与对照表（未上传返回 404；重开任务自动载入） |
+| GET  | `/api/submissions/{id}/comparison-export` | 下载含所有对照行的 UTF-8（BOM）CSV（`xxx.comparison.csv`） |
 | GET  | `/api/terms` | 术语表列表（支持 `?language=zh` 过滤，通用术语一并返回） |
 | POST | `/api/terms` | 新增术语（JSON：`language`/`canonical`/`variants`/`forbidden`/`note`） |
 | PUT  | `/api/terms/{id}` | 更新术语 |
@@ -149,20 +172,26 @@ pip install -r requirements.txt
 DB_PATH=./data/subtitles.db uvicorn app.main:app --reload --port 8000
 ```
 
+无需其他配置：数据库表在启动时自动创建；唯一可配置项为环境变量
+`DB_PATH`（默认 `/data/subtitles.db`，容器内已固定）。容器对外仅暴露
+**8000** 端口，访问 http://localhost:8000 即可。
+
 ## 目录结构
 
 ```
 app/
 ├── main.py          # FastAPI 路由与静态文件挂载（含片段合辑接口）
 ├── compilation.py   # 半开窗口校验 + cue 裁切/新时间轴拼接
+├── compare.py       # 双轨对照：交集/合并/中心偏差三级目标全局 DP 对齐
 ├── segmenter.py     # 单元切分 + DP 断句 + 边界重分配 + 问题生成
 ├── subtitles.py     # VTT/SRT 解析、VTT 导出、语言检测
 ├── terms.py         # 术语表模型 + 多层归一匹配 + 跨 cue 不一致检测引擎
-├── database.py      # SQLite 初始化与持久化（含术语表/术语发现/合辑配置）
+├── database.py      # SQLite 初始化与持久化（含术语表/术语发现/合辑配置/双轨对照）
 └── static/          # 原生 HTML/CSS/JS（无构建步骤）
 tests/smoke_test.py        # FastAPI TestClient 端到端冒烟测试
 tests/term_engine_check.py # 术语引擎独立逻辑校验（仅需标准库）
 tests/compilation_check.py  # 片段合辑裁切/拼接/导出逻辑校验（仅需标准库）
+tests/compare_check.py      # 双轨对照全局 DP 对齐逻辑校验（仅需标准库）
 examples/                  # demo.vtt / demo.srt / terms-demo.vtt 示例字幕
 Dockerfile
 docker-compose.yml
@@ -173,7 +202,8 @@ requirements.txt
 
 ```bash
 pip install -r requirements.txt
-DB_PATH=/tmp/test.db python3 tests/smoke_test.py   # 端到端（含术语审校）
+DB_PATH=/tmp/test.db python3 tests/smoke_test.py   # 端到端（含术语审校与双轨对照）
 python3 tests/term_engine_check.py                 # 术语引擎纯逻辑校验（无需依赖）
 python3 tests/compilation_check.py                  # 片段合辑纯逻辑校验（无需依赖）
+python3 tests/compare_check.py                      # 双轨对照 DP 纯逻辑校验（无需依赖）
 ```

@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from . import database as db
 from . import terms as terms_mod
 from . import compilation as comp_mod
+from . import compare as compare_mod
 from .segmenter import analyze
 from .subtitles import (LANGUAGE_NAMES, Cue, format_timestamp, parse_subtitle,
                         write_vtt)
@@ -168,6 +169,205 @@ async def api_compilation_export(sid: int):
     return Response(
         content=vtt,
         media_type="text/vtt; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{filename}"'},
+    )
+
+
+# --- 双轨对照（修订轨 vs 对照轨，全局 DP 对齐供人工校对） ---
+
+COMPARE_PAIR_LABELS = {
+    "1:1": "一对一",
+    "2:1": "修订合并",
+    "1:2": "对照合并",
+    "left_only": "仅修订轨",
+    "right_only": "仅对照轨",
+}
+
+
+def _row_pair_kind(row: dict) -> str:
+    if not row["right"]:
+        return "left_only"
+    if not row["left"]:
+        return "right_only"
+    if len(row["left"]) == 2:
+        return "2:1"
+    if len(row["right"]) == 2:
+        return "1:2"
+    return "1:1"
+
+
+def _cue_refs(seqs: list[int], cue_dicts: list[dict]) -> list[dict]:
+    return [
+        {
+            "seq": int(s),
+            "start": round(cue_dicts[s]["start_sec"], 3),
+            "end": round(cue_dicts[s]["end_sec"], 3),
+            "text": cue_dicts[s]["text"],
+        }
+        for s in seqs
+    ]
+
+
+def _right_refs(seqs: list[int], right_cues: list[dict]) -> list[dict]:
+    return [
+        {
+            "seq": int(s),
+            "start": round(right_cues[s]["start"], 3),
+            "end": round(right_cues[s]["end"], 3),
+            "text": right_cues[s]["text"],
+        }
+        for s in seqs
+    ]
+
+
+def _comparison_payload(record: dict, saved: dict) -> dict:
+    """由任务修订 cue 与已保存的对照轨/对齐行组装对照表响应。"""
+    left_dicts = record["cues"]
+    right_cues = saved["cues_json"]
+    rows_raw = saved["rows_json"]
+
+    rows = []
+    for i, r in enumerate(rows_raw):
+        left, right = r["left"], r["right"]
+        kind = _row_pair_kind(r)
+        rows.append({
+            "row": i,
+            "kind": kind,
+            "kind_label": COMPARE_PAIR_LABELS[kind],
+            "merged": bool(r.get("merged")),
+            "overlap_ms": int(r.get("overlap_ms", 0)),
+            "center_delta_ms": int(r.get("center_delta_ms", 0)),
+            "left": _cue_refs(left, left_dicts),
+            "right": _right_refs(right, right_cues),
+        })
+
+    overlaps = [r["overlap_ms"] for r in rows if r["kind"] not in
+                ("left_only", "right_only")]
+    stats = {
+        "left_count": len(left_dicts),
+        "right_count": len(right_cues),
+        "total_rows": len(rows),
+        "paired_rows": sum(1 for r in rows if r["left"] and r["right"]),
+        "left_only_rows": sum(1 for r in rows if r["left"] and not r["right"]),
+        "right_only_rows": sum(1 for r in rows if r["right"] and not r["left"]),
+        "merge_rows": sum(1 for r in rows if r["merged"]),
+        "total_overlap_ms": sum(overlaps),
+        "total_center_delta_ms":
+            sum(r["center_delta_ms"] for r in rows if r["left"]
+                and r["right"]),
+        "mean_center_delta_ms": round(
+            sum(r["center_delta_ms"] for r in rows if r["left"] and r["right"])
+            / len(overlaps), 1) if overlaps else None,
+    }
+    return {
+        "filename": saved["filename"],
+        "format": saved["format"],
+        "updated_at": saved["updated_at"],
+        "stats": stats,
+        "rows": rows,
+    }
+
+
+@app.post("/api/submissions/{sid}/comparison", status_code=201)
+async def api_save_comparison(sid: int, file: UploadFile = File(...)):
+    """上传对照轨 SRT/WebVTT：与已保存修订轨做全局 DP 对齐并覆盖保存。"""
+    record = db.get_artifact(sid)
+    if record is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    try:
+        content = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            content = raw.decode("latin-1")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400,
+                                detail="无法识别文件编码，请使用 UTF-8")
+    name = file.filename or "comparison.vtt"
+    fmt = "srt" if name.lower().endswith(".srt") else "vtt"
+    try:
+        parsed = parse_subtitle(content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if len(parsed) > compare_mod.MAX_CUES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"对照轨 cue 数量过多（上限 {compare_mod.MAX_CUES} 条）")
+
+    left_cues = [Cue(start=c["start_sec"], end=c["end_sec"], text=c["text"])
+                 for c in record["cues"]]
+    align = compare_mod.align_tracks(left_cues, parsed)
+    right_stored = [
+        {"start": round(c.start, 3), "end": round(c.end, 3), "text": c.text}
+        for c in parsed
+    ]
+    rows_stored = [
+        {"left": r.left, "right": r.right, "overlap_ms": r.overlap_ms,
+         "center_delta_ms": r.center_delta_ms, "merged": r.merged}
+        for r in align.rows
+    ]
+    db.save_comparison(sid, name, fmt, right_stored, rows_stored)
+    saved = db.get_comparison(sid)
+    return _comparison_payload(record, saved)
+
+
+@app.get("/api/submissions/{sid}/comparison")
+async def api_get_comparison(sid: int):
+    record = db.get_artifact(sid)
+    if record is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    saved = db.get_comparison(sid)
+    if saved is None:
+        raise HTTPException(status_code=404, detail="该任务尚未上传对照轨")
+    return _comparison_payload(record, saved)
+
+
+@app.get("/api/submissions/{sid}/comparison-export")
+async def api_comparison_export(sid: int):
+    """导出含所有对照行的 UTF-8 CSV（带 BOM，便于 Excel 直接打开）。"""
+    record = db.get_artifact(sid)
+    if record is None:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    saved = db.get_comparison(sid)
+    if saved is None:
+        raise HTTPException(status_code=404, detail="该任务尚未上传对照轨")
+    payload = _comparison_payload(record, saved)
+
+    def _cell(side: list[dict]) -> tuple[str, str, str]:
+        if not side:
+            return "", "", ""
+        seqs = "+".join(str(c["seq"] + 1) for c in side)
+        tc = "\n".join(
+            f"{format_timestamp(c['start'])} --> {format_timestamp(c['end'])}"
+            for c in side)
+        text = "\n".join(c["text"] for c in side)
+        return seqs, tc, text
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "对照行", "配对类型", "修订cue序号", "修订轨时间码", "修订轨文本",
+        "对照cue序号", "对照轨时间码", "对照轨文本",
+        "交集时长(ms)", "中心偏差(ms)",
+    ])
+    for r in payload["rows"]:
+        lseq, ltc, ltext = _cell(r["left"])
+        rseq, rtc, rtext = _cell(r["right"])
+        writer.writerow([
+            r["row"] + 1, r["kind_label"], lseq, ltc, ltext,
+            rseq, rtc, rtext,
+            r["overlap_ms"] if r["left"] and r["right"] else "",
+            r["center_delta_ms"] if r["left"] and r["right"] else "",
+        ])
+
+    base = record["submission"]["filename"].rsplit(".", 1)[0]
+    filename = f"{base}.comparison.csv"
+    return Response(
+        content="﻿" + buf.getvalue(),  # BOM，便于 Excel 直接打开
+        media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition":
                  f'attachment; filename="{filename}"'},
     )

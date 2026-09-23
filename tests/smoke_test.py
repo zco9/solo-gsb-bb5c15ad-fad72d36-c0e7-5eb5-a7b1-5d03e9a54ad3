@@ -6,6 +6,8 @@
 """
 import os
 import sys
+import csv
+import io
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -418,6 +420,123 @@ def main() -> None:
         # 不存在的任务
         assert client.put("/api/submissions/999999/compilation",
                           json={"windows": []}).status_code == 404
+
+        # --- 双轨对照 ---
+        cmp_vtt = (
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:02.000\n第一句修订后的文本内容\n\n"
+            "00:00:02.000 --> 00:00:04.000\n第二句修订后的文本内容\n\n"
+            "00:00:04.000 --> 00:00:06.000\n第三句修订后的文本内容\n"
+        )
+        cm = client.post(
+            "/api/analyze",
+            files={"file": ("cmp-main.vtt", cmp_vtt, "text/vtt")},
+            data={"max_chars": "40", "min_dwell": "0.5", "max_cps": "30"},
+        ).json()
+        cmid = cm["id"]
+        assert len(cm["cues"]) == 3
+
+        # 未上传对照轨：GET / CSV 导出均 404
+        assert client.get(
+            f"/api/submissions/{cmid}/comparison").status_code == 404
+        assert client.get(
+            f"/api/submissions/{cmid}/comparison-export").status_code == 404
+        assert client.get(
+            "/api/submissions/999999/comparison").status_code == 404
+
+        # 对照轨（SRT）：前两条合并成一条，第三条时间微偏；
+        # 修订 cue1+2 的并集 [0,4) 与对照第一条 [0,4) 正时长交集 4s
+        cmp_srt = (
+            "1\n00:00:00,000 --> 00:00:04,000\n"
+            "对照轨把前两句合成了一条\n\n"
+            "2\n00:00:04,100 --> 00:00:06,100\n"
+            "第三句对照轨时间略偏\n"
+        )
+        up = client.post(
+            f"/api/submissions/{cmid}/comparison",
+            files={"file": ("other.srt", cmp_srt, "application/x-subrip")})
+        assert up.status_code == 201
+        body = up.json()
+        assert body["format"] == "srt"
+        assert body["stats"]["right_count"] == 2
+        assert body["stats"]["merge_rows"] == 1
+        # 第一行：修订 1+2 合并配对对照 1；第二行：1:1
+        kinds = [r["kind"] for r in body["rows"]]
+        assert kinds == ["2:1", "1:1"], kinds
+        first = body["rows"][0]
+        assert [c["seq"] for c in first["left"]] == [0, 1]
+        assert [c["seq"] for c in first["right"]] == [0]
+        # 并集 [0,4.001)（段器重分配延长 1ms）∩ [0,4) = 4000ms
+        assert first["overlap_ms"] == 4000
+        assert first["left"][0]["text"] == "第一句修订后的文本内容"
+        # 第三句修订时间 4.0→6.001 与对照 4.1→6.1：中点差约 1ms，取整为 1ms
+        second = body["rows"][1]
+        assert abs(second["center_delta_ms"] - 100) <= 1
+        assert body["stats"]["paired_rows"] == 2
+        assert body["stats"]["left_only_rows"] == 0
+
+        # 重开任务：GET 取回同一份对照表（按任务持久化）
+        again = client.get(f"/api/submissions/{cmid}/comparison")
+        assert again.status_code == 200
+        assert again.json()["rows"] == body["rows"]
+        assert again.json()["filename"] == "other.srt"
+
+        # 非字幕文件 / 空文件：400
+        bad = client.post(
+            f"/api/submissions/{cmid}/comparison",
+            files={"file": ("x.vtt", b"not a subtitle", "text/vtt")})
+        assert bad.status_code == 400
+        empty = client.post(
+            f"/api/submissions/{cmid}/comparison",
+            files={"file": ("x.vtt", b"", "text/vtt")})
+        assert empty.status_code == 400
+
+        # 未配对 cue 独立成行：完全错位时间轴
+        far_vtt = (
+            "WEBVTT\n\n"
+            "00:10:00.000 --> 00:10:02.000\n完全对不上时间轴的内容\n"
+        )
+        far = client.post(
+            f"/api/submissions/{cmid}/comparison",
+            files={"file": ("far.vtt", far_vtt, "text/vtt")})
+        assert far.status_code == 201  # 重新上传覆盖
+        fbody = far.json()
+        assert fbody["stats"]["paired_rows"] == 0
+        assert fbody["stats"]["left_only_rows"] == 3
+        assert fbody["stats"]["right_only_rows"] == 1
+        assert fbody["stats"]["total_overlap_ms"] == 0
+        # 全部 cue 恰好各出现一次
+        solo_left = [r for r in fbody["rows"] if not r["right"]]
+        solo_right = [r for r in fbody["rows"] if not r["left"]]
+        assert len(solo_left) == 3 and len(solo_right) == 1
+
+        # 覆盖后 GET 反映新对照轨
+        got = client.get(f"/api/submissions/{cmid}/comparison").json()
+        assert got["filename"] == "far.vtt"
+
+        # CSV 导出：UTF-8 BOM、含全部对照行、合并 cue 单元格内含两段
+        client.post(
+            f"/api/submissions/{cmid}/comparison",
+            files={"file": ("other.srt", cmp_srt, "application/x-subrip")})
+        csv_resp = client.get(f"/api/submissions/{cmid}/comparison-export")
+        assert csv_resp.status_code == 200
+        assert "comparison.csv" in csv_resp.headers["content-disposition"]
+        text = csv_resp.text
+        assert text.startswith("﻿")
+        assert "对照行,配对类型" in text
+        csv_rows = list(csv.reader(io.StringIO(text.lstrip("﻿"))))
+        assert len(csv_rows) == 3  # 表头 + 2 对照行
+        assert csv_rows[1][1] == "修订合并"
+        # 合并行修订轨序号为 1+2、时间码/文本单元格内含两段（换行分隔）
+        assert csv_rows[1][2] == "1+2"
+        assert "\n" in csv_rows[1][3] and "\n" in csv_rows[1][4]
+        assert "对照轨把前两句合成了一条" in csv_rows[1][7]
+        assert csv_rows[1][8] == "4000"
+        assert csv_rows[2][1] == "一对一" and int(csv_rows[2][9]) in (99, 100, 101)
+
+        # 覆盖对照轨不影响原修订导出
+        assert client.get(f"/api/submissions/{cmid}/export").text.count(
+            "-->") == 3
 
     print("SMOKE_TESTS_OK")
 

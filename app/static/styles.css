@@ -342,3 +342,41 @@ li.accepted .fnd-status { color: var(--ok-ink); }
   padding: 1px 7px;
   font-variant-numeric: tabular-nums;
 }
+
+/* --- 双轨对照 --- */
+.compare {
+  margin-top: 16px;
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+#cmp-form { margin: 4px 0 2px; }
+#cmp-form .form-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+#cmp-form .file-label { flex: 1 1 320px; }
+#cmp-btn { white-space: nowrap; }
+.cmp-result { margin-top: 10px; }
+#cmp-meta { margin-bottom: 8px; font-size: 13px; }
+.cmp-join {
+  display: block;
+  height: 0;
+  border-top: 1px dashed var(--line);
+  margin: 5px 0;
+}
+.cmp-tag {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+.cmp-tag.pair { background: #e0e9ff; color: var(--brand-dark); }
+.cmp-tag.merged { background: #e7f6ec; color: var(--ok-ink); }
+.cmp-tag.solo { background: #f0e6ff; color: #6b2fb3; }
+#cmp-table tr.cmp-solo { background: #faf7ff; }
+#cmp-table tr.cmp-merged { background: var(--ok-bg); }
+.cmp-text { min-width: 220px; }
+.stat.good b { color: var(--ok-ink); }

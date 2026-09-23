@@ -59,6 +59,16 @@ CREATE TABLE IF NOT EXISTS compilations (
     updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS comparisons (
+    submission_id INTEGER PRIMARY KEY
+        REFERENCES submissions(id) ON DELETE CASCADE,
+    filename      TEXT NOT NULL,
+    format        TEXT NOT NULL DEFAULT 'vtt',
+    cues_json     TEXT NOT NULL DEFAULT '[]',
+    rows_json     TEXT NOT NULL DEFAULT '[]',
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS terms (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     language    TEXT NOT NULL DEFAULT 'all',
@@ -91,6 +101,7 @@ CREATE INDEX IF NOT EXISTS idx_cues_submission ON cues(submission_id);
 CREATE INDEX IF NOT EXISTS idx_issues_submission ON issues(submission_id);
 CREATE INDEX IF NOT EXISTS idx_issues_language ON issues(submission_id, language);
 CREATE INDEX IF NOT EXISTS idx_term_findings_sub ON term_findings(submission_id);
+CREATE INDEX IF NOT EXISTS idx_comparisons_sub ON comparisons(submission_id);
 """
 
 
@@ -246,6 +257,43 @@ def get_compilation(submission_id: int) -> list[tuple[float, float]] | None:
         return None
     raw = json.loads(row["windows_json"] or "[]")
     return [(float(w["start"]), float(w["end"])) for w in raw]
+
+
+# --- 双轨对照（对照轨与对齐结果按任务保存，重新上传覆盖） ---
+
+def save_comparison(submission_id: int, filename: str, fmt: str,
+                    cues: list[dict], rows: list[dict]) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO comparisons
+                   (submission_id, filename, format, cues_json, rows_json,
+                    updated_at)
+               VALUES (?, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(submission_id) DO UPDATE SET
+                   filename = excluded.filename,
+                   format = excluded.format,
+                   cues_json = excluded.cues_json,
+                   rows_json = excluded.rows_json,
+                   updated_at = datetime('now')""",
+            (submission_id, filename, fmt,
+             json.dumps(cues, ensure_ascii=False),
+             json.dumps(rows, ensure_ascii=False)),
+        )
+
+
+def get_comparison(submission_id: int) -> dict | None:
+    """返回已保存的对照轨与对照表；从未上传返回 None。"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM comparisons WHERE submission_id = ?",
+            (submission_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    d = dict(row)
+    d["cues_json"] = json.loads(d["cues_json"] or "[]")
+    d["rows_json"] = json.loads(d["rows_json"] or "[]")
+    return d
 
 
 # --- 术语表 ---
